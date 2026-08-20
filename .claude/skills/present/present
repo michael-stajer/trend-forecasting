@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""present — put a rendered HTML page on Michael's screen, or interrupt him.
+
+Zero non-stdlib dependencies.
+
+Config resolution, in order:
+1. PRESENT_URL / PRESENT_TOKEN environment variables (used by containers).
+2. A present.config.json next to this script, or at $PRESENT_CONFIG
+   — {"url": "...", "token": "..."}. This is how the claude.ai skill bundle
+   ships its config, where env vars are not injected.
+
+Exit codes: 0 ok, 1 network/server error, 2 bad usage.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+TIMEOUT = 30
+
+_CACHED = None
+
+
+def _load_config():
+    global _CACHED
+    if _CACHED is not None:
+        return _CACHED
+    url = os.environ.get("PRESENT_URL", "").rstrip("/")
+    token = os.environ.get("PRESENT_TOKEN", "")
+    if not url or not token:
+        # Fall back to a bundled config file.
+        candidates = [os.environ.get("PRESENT_CONFIG")] if os.environ.get("PRESENT_CONFIG") else []
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "present.config.json"))
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                url = url or str(cfg.get("url", "")).rstrip("/")
+                token = token or str(cfg.get("token", ""))
+                if url and token:
+                    break
+            except (OSError, ValueError):
+                continue
+    _CACHED = (url, token)
+    return _CACHED
+
+
+def env_or_die():
+    url, token = _load_config()
+    if not url or not token:
+        sys.stderr.write(
+            "ERROR: no config. Set PRESENT_URL and PRESENT_TOKEN, or provide a "
+            "present.config.json next to the CLI.\n"
+        )
+        sys.exit(2)
+    return url, token
+
+
+def request(method, path, token, body=None, auth=True, timeout=TIMEOUT):
+    url, _ = env_or_die()
+    full = url + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(full, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if auth:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode()
+        return json.loads(raw) if raw else {}
+
+
+def net_fail(url, extra_path=None):
+    sys.stderr.write(f"ERROR: present-server unreachable at {url}\n")
+    if extra_path:
+        sys.stderr.write(f"Local file: {extra_path}\n")
+    sys.exit(1)
+
+
+def expand_url(u):
+    """Turn a leading-slash path into a full URL against PRESENT_URL."""
+    if u and u.startswith("/"):
+        base, _ = env_or_die()
+        return base + u
+    return u
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_show(args):
+    url, token = env_or_die()
+    path = os.path.abspath(args.file)
+    if not os.path.isfile(path):
+        sys.stderr.write(f"ERROR: no such file: {path}\n")
+        sys.exit(2)
+    with open(path, "r", encoding="utf-8") as f:
+        html = f.read()
+    body = {
+        "html": html,
+        "title": args.title,
+        "repo": args.repo,
+        "pinned": bool(args.pin),
+    }
+    if args.id:
+        body["id"] = args.id
+    try:
+        res = request("POST", "/api/artifact", token, body)
+    except (urllib.error.URLError, OSError):
+        net_fail(url, path)
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"ERROR: server returned {e.code}: {e.read().decode()}\n")
+        sys.stderr.write(f"Local file: {path}\n")
+        sys.exit(1)
+    artifact_url = res["url"]
+    print(artifact_url)
+    if args.open:
+        try:
+            push = request("POST", "/api/push", token, {
+                "type": "open_url",
+                "target": args.target,
+                "payload": {"url": artifact_url, "title": args.title},
+            })
+            if push.get("stale_target"):
+                sys.stderr.write("WARN: no device seen recently; opened on last-known device.\n")
+            if push.get("downgraded"):
+                sys.stderr.write("NOTE: rate-limited; delivered as a notification instead of a tab.\n")
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            sys.stderr.write("WARN: artifact saved but open push failed.\n")
+
+
+def cmd_update(args):
+    url, token = env_or_die()
+    path = os.path.abspath(args.file)
+    if not os.path.isfile(path):
+        sys.stderr.write(f"ERROR: no such file: {path}\n")
+        sys.exit(2)
+    with open(path, "r", encoding="utf-8") as f:
+        html = f.read()
+    try:
+        res = request("POST", "/api/artifact", token, {"id": args.id, "html": html})
+    except (urllib.error.URLError, OSError):
+        net_fail(url, path)
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"ERROR: server returned {e.code}: {e.read().decode()}\n")
+        sys.exit(1)
+    print(res["url"])
+
+
+def cmd_open(args):
+    url, token = env_or_die()
+    try:
+        res = request("POST", "/api/push", token, {
+            "type": "open_url",
+            "target": args.target,
+            "payload": {"url": expand_url(args.url)},
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        net_fail(url)
+    if res.get("downgraded"):
+        sys.stderr.write("NOTE: rate-limited; delivered as a notification.\n")
+    print(json.dumps(res))
+
+
+def cmd_notify(args):
+    url, token = env_or_die()
+    payload = {"message": args.message}
+    if args.title:
+        payload["title"] = args.title
+    if args.url:
+        payload["url"] = expand_url(args.url)
+    try:
+        res = request("POST", "/api/push", token, {
+            "type": "notify",
+            "target": args.target,
+            "level": args.level,
+            "payload": payload,
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        net_fail(url)
+    print(json.dumps(res))
+
+
+def cmd_devices(args):
+    url, token = env_or_die()
+    try:
+        res = request("GET", "/api/devices", token)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        net_fail(url)
+    for d in res.get("devices", []):
+        mark = "*" if d.get("active") else " "
+        print(f"{mark} {d['label']:<20} {d['kind']:<7} last_seen={d['last_seen']}")
+
+
+def cmd_list(args):
+    url, token = env_or_die()
+    try:
+        res = request("GET", f"/api/artifacts?limit={args.limit}", token)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        net_fail(url)
+    for a in res.get("artifacts", []):
+        pin = "pin" if a.get("pinned") else "   "
+        print(f"{pin} {a['id']:<14} v{a['version']:<3} {a.get('title') or ''}  {a['url']}")
+
+
+def cmd_check(args):
+    url, token = env_or_die()
+    try:
+        res = request("GET", "/healthz", token, auth=False, timeout=8)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        sys.stderr.write(f"UNREACHABLE: {url} ({e})\n")
+        sys.exit(1)
+    print(f"OK: {url} (server version {res.get('version')})")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="present", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("show", help="store an HTML file and print its URL")
+    s.add_argument("file")
+    s.add_argument("--id")
+    s.add_argument("--title")
+    s.add_argument("--repo")
+    s.add_argument("--open", action="store_true", help="also push open_url to a device")
+    s.add_argument("--target", default="active")
+    s.add_argument("--pin", action="store_true")
+    s.set_defaults(func=cmd_show)
+
+    u = sub.add_parser("update", help="replace an existing artifact in place")
+    u.add_argument("id")
+    u.add_argument("file")
+    u.set_defaults(func=cmd_update)
+
+    o = sub.add_parser("open", help="open a URL on a device")
+    o.add_argument("url")
+    o.add_argument("--target", default="active")
+    o.set_defaults(func=cmd_open)
+
+    n = sub.add_parser("notify", help="send a notification")
+    n.add_argument("message")
+    n.add_argument("--title")
+    n.add_argument("--url")
+    n.add_argument("--level", default="normal", choices=["low", "normal", "high"])
+    n.add_argument("--target", default="active")
+    n.set_defaults(func=cmd_notify)
+
+    d = sub.add_parser("devices", help="list registered devices")
+    d.set_defaults(func=cmd_devices)
+
+    l = sub.add_parser("list", help="list recent artifacts")
+    l.add_argument("--limit", type=int, default=20)
+    l.set_defaults(func=cmd_list)
+
+    c = sub.add_parser("check", help="reachability check")
+    c.set_defaults(func=cmd_check)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
